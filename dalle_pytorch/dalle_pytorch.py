@@ -582,7 +582,9 @@ class DALLE(nn.Module):
 
             sample_log_probas = cache['log_proba'][:, None] + torch.log(torch.gather(probs, 1, sample) + eps)
             sample_log_probas = sample_log_probas.flatten()
-            best_indices = sample_log_probas.argsort(descending=True)[:beam_width]
+            sample_probas = stable_softmax(sample_log_probas, dim=-1)
+            best_indices = torch.multinomial(sample_probas, beam_width, replacement=True)  # TODO: Try repl=False?
+
             best_bases = best_indices // beam_width
             best_samples = best_indices % beam_width
 
