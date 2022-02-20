@@ -1,4 +1,3 @@
-from collections import namedtuple
 from math import log2, sqrt
 import torch
 from torch import nn, einsum
@@ -374,8 +373,6 @@ class CLIP(nn.Module):
         return loss
 
 
-Hypot = namedtuple('Hypot', ['out', 'cache', 'log_proba'])
-
 # main DALL-E class
 
 class DALLE(nn.Module):
@@ -568,34 +565,31 @@ class DALLE(nn.Module):
 
         assert text.shape[0] == 1 and use_cache and cond_scale == 1.0  # Assumptions for beam search
 
-        beam = [Hypot(out=out.clone(), cache={}, log_proba=0.0)
-                for _ in range(beam_width)]
+        out = out.repeat(beam_width, 1)
+        cache = {'log_proba': torch.zeros(beam_width, device=text.device)}
         for cur_len in range(out.shape[1], total_len):
-            new_beam = []
-            for hypot in beam:
-                is_image = cur_len >= text_seq_len
+            is_image = cur_len >= text_seq_len
 
-                text, image = hypot.out[:, :text_seq_len], hypot.out[:, text_seq_len:]
-                new_cache = hypot.cache.copy()
-                logits = self(text, image, cache = new_cache)
-                logits = logits[:, -1, :]
+            text, image = out[:, :text_seq_len], out[:, text_seq_len:]
+            logits = self(text, image, cache = cache)
+            logits = logits[:, -1, :]
 
-                filtered_logits = top_k_top_p_filtering(logits, top_k = top_k, top_p = top_p)
-                probs = stable_softmax(filtered_logits / temperature, dim = -1)
-                sample = torch.multinomial(probs, beam_width, replacement=True)
-                sample -= (num_text_tokens if is_image else 0) # offset sampled token if it is an image token, since logit space is composed of text and then image tokens
+            filtered_logits = top_k_top_p_filtering(logits, top_k = top_k, top_p = top_p)
+            probs = stable_softmax(filtered_logits / temperature, dim = -1)
 
-                print('dbg', hypot.out.shape, sample.shape, beam_width)
-                for i in range(beam_width):
-                    new_beam.append(Hypot(out=torch.cat((hypot.out, sample[:, i:i + 1]), dim=-1),
-                                          cache=new_cache,
-                                          log_proba=hypot.log_proba + torch.log(probs[0, sample[:, i]] + eps)))
+            sample = torch.multinomial(probs, beam_width, replacement=True)
+            sample -= (num_text_tokens if is_image else 0) # offset sampled token if it is an image token, since logit space is composed of text and then image tokens
 
-            new_beam.sort(key=lambda hypot: hypot.log_proba, reverse=True)
-            beam = new_beam[:beam_width]
-            del new_beam
+            sample_log_probas = cache['log_proba'][:, None] + torch.log(torch.gather(probs, 1, sample) + eps)
+            sample_log_probas = sample_log_probas.flatten()
+            best_indices = sample_log_probas.argsort(descending=True)[:beam_width]
+            best_bases = best_indices // beam_width
+            best_samples = best_indices % beam_width
 
-        out = torch.cat([hypot.out for hypot in beam], dim=0)
+            out = torch.cat([out[best_bases], sample[best_bases, best_samples][:, None]], dim=-1)
+            cache = {key: value[best_bases] if isinstance(value, torch.Tensor) else value
+                     for key, value in cache.items()}
+            cache['log_proba'] = sample_log_probas[best_indices]
 
         text_seq = out[:, :text_seq_len]
 
