@@ -8,6 +8,7 @@ from axial_positional_embedding import AxialPositionalEmbedding
 from einops import rearrange
 
 from dalle_pytorch import distributed_utils
+from dalle_pytorch.attention import stable_softmax
 from dalle_pytorch.vae import OpenAIDiscreteVAE, VQGanVAE
 from dalle_pytorch.transformer import Transformer, DivideMax
 
@@ -581,10 +582,11 @@ class DALLE(nn.Module):
             logits = logits[:, -1, :]
 
             filtered_logits = top_k_top_p_filtering(logits, top_k = top_k, top_p = top_p)
-            sample = gumbel_sample(filtered_logits, temperature = temperature, dim = -1)
+            probs = stable_softmax(filtered_logits / temperature, dim = -1)
+            sample = torch.multinomial(probs, 1)
 
             sample -= (num_text_tokens if is_image else 0) # offset sampled token if it is an image token, since logit space is composed of text and then image tokens
-            out = torch.cat((out, sample[:, None]), dim=-1)
+            out = torch.cat((out, sample), dim=-1)
 
         text_seq = out[:, :text_seq_len]
 
