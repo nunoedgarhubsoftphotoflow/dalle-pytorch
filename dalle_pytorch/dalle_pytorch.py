@@ -1,3 +1,4 @@
+from collections import namedtuple
 from math import log2, sqrt
 import torch
 from torch import nn, einsum
@@ -372,6 +373,9 @@ class CLIP(nn.Module):
         loss = (F.cross_entropy(sim, labels) + F.cross_entropy(sim.t(), labels)) / 2
         return loss
 
+
+Hypot = namedtuple('Hypot', ['out', 'cache', 'log_proba'])
+
 # main DALL-E class
 
 class DALLE(nn.Module):
@@ -542,6 +546,8 @@ class DALLE(nn.Module):
         num_init_img_tokens = None,
         cond_scale = 1.,
         use_cache = False,
+        beam_width = 1,
+        eps = 1e-20,
     ):
         vae, text_seq_len, image_seq_len, num_text_tokens = self.vae, self.text_seq_len, self.image_seq_len, self.num_text_tokens
         total_len = text_seq_len + image_seq_len
@@ -560,33 +566,36 @@ class DALLE(nn.Module):
             indices = indices[:, :num_img_tokens]
             out = torch.cat((out, indices), dim = -1)
 
-        prev_cache = None
-        cache = {} if use_cache else None
+        assert text.shape[0] == 1 and use_cache and cond_scale == 1.0  # Assumptions for beam search
+
+        beam = [Hypot(out=out.clone(), cache={}, log_proba=0.0)
+                for _ in range(beam_width)]
         for cur_len in range(out.shape[1], total_len):
-            is_image = cur_len >= text_seq_len
+            new_beam = []
+            for hypot in beam:
+                is_image = cur_len >= text_seq_len
 
-            text, image = out[:, :text_seq_len], out[:, text_seq_len:]
+                text, image = hypot.out[:, :text_seq_len], hypot.out[:, text_seq_len:]
+                new_cache = hypot.cache.copy()
+                logits = self(text, image, cache = new_cache)
+                logits = logits[:, -1, :]
 
-            if cond_scale != 1 and use_cache:
-                # copy the cache state to infer from the same place twice
-                prev_cache = cache.copy()
+                filtered_logits = top_k_top_p_filtering(logits, top_k = top_k, top_p = top_p)
+                probs = stable_softmax(filtered_logits / temperature, dim = -1)
+                sample = torch.multinomial(probs, beam_width, replacement=True)
+                sample -= (num_text_tokens if is_image else 0) # offset sampled token if it is an image token, since logit space is composed of text and then image tokens
 
-            logits = self(text, image, cache = cache)
+                print('dbg', hypot.out.shape, sample.shape, beam_width)
+                for i in range(beam_width):
+                    new_beam.append(Hypot(out=torch.cat((hypot.out, sample[:, i:i + 1]), dim=-1),
+                                          cache=new_cache,
+                                          log_proba=hypot.log_proba + torch.log(probs[0, sample[:, i]] + eps)))
 
-            if cond_scale != 1:
-                # discovery by Katherine Crowson
-                # https://twitter.com/RiversHaveWings/status/1478093658716966912
-                null_cond_logits = self(text, image, null_cond_prob = 1., cache = prev_cache)
-                logits = null_cond_logits + (logits - null_cond_logits) * cond_scale
+            new_beam.sort(key=lambda hypot: hypot.log_proba, reverse=True)
+            beam = new_beam[:beam_width]
+            del new_beam
 
-            logits = logits[:, -1, :]
-
-            filtered_logits = top_k_top_p_filtering(logits, top_k = top_k, top_p = top_p)
-            probs = stable_softmax(filtered_logits / temperature, dim = -1)
-            sample = torch.multinomial(probs, 1)
-
-            sample -= (num_text_tokens if is_image else 0) # offset sampled token if it is an image token, since logit space is composed of text and then image tokens
-            out = torch.cat((out, sample), dim=-1)
+        out = torch.cat([hypot.out for hypot in beam], dim=0)
 
         text_seq = out[:, :text_seq_len]
 
